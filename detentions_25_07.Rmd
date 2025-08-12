@@ -1,0 +1,500 @@
+---
+title: "detentions_25_07"
+author: "Joe Yerardi/The Philadelphia Inquirer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Setup}
+knitr::opts_chunk$set(
+  echo = FALSE,     # Don’t show the code itself
+  warning = TRUE,  # Show warnings
+  message = FALSE   # Don’t show messages
+)
+
+# Suppress scientific notation
+options(scipen = 999)
+```
+
+```{r Confirm Census API key is properly installed in .Renviron file}
+Sys.getenv("CENSUS_API_KEY")
+```
+
+```{r import packages}
+library(htmlwidgets)
+library(janitor)
+library(forcats)
+library(leaflet)
+library(leaflet.extras)
+library(lubridate)
+library(mapview)
+library(purrr)
+library(readxl)
+library(rmapshaper)
+library(openxlsx2)
+library(scales)
+library(sf)
+library(tidycensus)
+library(tidygeocoder)
+library(tidyverse)
+library(tigris)
+```
+
+```{r Cache shapefiles for use in future sessions}
+options(tigris_use_cache = TRUE)
+```
+
+```{r Import the detentions facilities data from ICE}
+# Source: https://www.ice.gov/detain/detention-management
+
+# Set the folder path
+folder_path <- "data/ice"
+
+# List all Excel files in the folder
+file_list <- list.files(path = folder_path, pattern = "\\.xlsx$", full.names = TRUE)
+
+# Import and combine each of the files' facilities worksheets
+facilities <- file_list %>% 
+  map_dfr(~ {
+    # Read in each complete facilities worksheet once
+    read_excel(.x,
+               sheet = "Facilities FY25",
+               skip = 6) %>%
+      clean_names() %>% 
+      mutate(ice_threat_level_1 = as.numeric(ice_threat_level_1),
+             guaranteed_minimum = as.numeric(guaranteed_minimum), 
+             last_inspection_end_date = suppressWarnings(parse_date_time(as.character(last_inspection_end_date), orders = c("mdy", "m/d/y"))), # Add the data extract date
+             file_name = .x, # Add the file name
+             # Read in just the cell containing the extract date in each worksheet and extract the date from the cell text
+             extract_date = mdy(str_extract(read_excel(.x,
+                                                       sheet = "Facilities FY25",
+                                                       range = "A6",
+                                                       col_names = FALSE)[[1]],
+          "\\d{2}/\\d{2}/\\d{4}"
+          ))
+      )
+  })
+
+# Manually set extract date of 2/8/25 for 2/14/25 report due to its facilities tab having the incorrect extract date
+facilities <- facilities %>% 
+  mutate(extract_date = if_else(file_name == "data/ice/FY25_detentionStats02142025.xlsx",
+                                as.Date("2025-02-08"),
+                                extract_date))
+
+# Drop 7/7/25 data extract due to pervasive reporting anomalies (details: https://austinkocher.substack.com/p/is-ice-intentionally-under-reporting)
+facilities <- facilities %>%
+  filter(extract_date != "2025-07-07")
+```
+
+```{r # Apply the Interval ADP calculation to relevant columns}
+# Source: https://relevant-research.com/assets/pdf/methodology_writeup.pdf
+
+# Average Daily Population (ADP) = the fiscal-year-to-date average of a facility’s detained population as of a given reporting date. It does not provide the current actually detained population at individual facilities as of each reporting date. The reporting date is documented in the “Facilities FY25” tab above the table.
+
+# Interval ADP formula: ((ADP on extract date two * (days between extract date two - start date of current fiscal year (Oct.1)) - ((ADP on extract date one * (days between extract date one - start date of current fiscal year (Oct. 1))) / (days between extract date two - extract date one))
+
+# Create a function to calculate Interval ADP
+calculate_interval_adp <- function(df, fiscal_year_start = as.Date("2024-10-01")) {
+  df <- df %>% 
+    # Sort the data in preparation for calculating the interval ADP
+    arrange(state, city, name, extract_date) %>% 
+    group_by(state, city, name) %>% 
+    mutate(adp = level_a + level_b + level_c + level_d, # Calculate the adp
+           current_stays = adp * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays = lag(adp) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_adp = (current_stays - previous_stays) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_level_a = level_a * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_level_a = lag(level_a) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_level_a = (current_stays_level_a - previous_stays_level_a) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_level_b = level_b * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_level_b = lag(level_b) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_level_b = (current_stays_level_b - previous_stays_level_b) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_level_c = level_c * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_level_c = lag(level_c) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_level_c = (current_stays_level_c - previous_stays_level_c) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_level_d = level_d * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_level_d = lag(level_d) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_level_d = (current_stays_level_d - previous_stays_level_d) / (as.numeric(extract_date - lag(extract_date))),
+           pct_interval_level_a = round((interval_level_a / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+           pct_interval_level_b = round((interval_level_b / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+           pct_interval_level_c = round((interval_level_c / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+           pct_interval_level_d = round((interval_level_d / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+           current_stays_male_crim = male_crim * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_male_crim = lag(male_crim) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_male_crim = (current_stays_male_crim - previous_stays_male_crim) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_male_non_crim = male_non_crim * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_male_non_crim = lag(male_non_crim) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_male_non_crim = (current_stays_male_non_crim - previous_stays_male_non_crim) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_female_crim = female_crim * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_female_crim = lag(female_crim) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_female_crim = (current_stays_female_crim - previous_stays_female_crim) / (as.numeric(extract_date - lag(extract_date))),
+           current_stays_female_non_crim = female_non_crim * (as.numeric(extract_date - fiscal_year_start) + 1),
+           previous_stays_female_non_crim = lag(female_non_crim) * (as.numeric(lag(extract_date) - fiscal_year_start) + 1),
+           interval_female_non_crim = (current_stays_female_non_crim - previous_stays_female_non_crim) / (as.numeric(extract_date - lag(extract_date))),
+           interval_crim = interval_male_crim + interval_female_crim,
+           interval_non_crim = interval_male_non_crim + interval_female_non_crim,
+           pct_interval_crim = round((interval_crim / (interval_crim + interval_non_crim)) * 100),
+           pct_interval_non_crim = round((interval_non_crim / (interval_crim + interval_non_crim)) * 100)
+           ) %>% 
+  ungroup() %>% 
+    # Drop any records where current stays are fewer than previous stays as this is not logically possible and indicates a reporting anomaly
+  filter(current_stays >= previous_stays) %>% 
+    # Drop intermediate columns used for calculations
+  select(-starts_with(c("current_stays", "previous_stays")))
+}
+
+# Apply the Interval ADP calculations
+facilities <- calculate_interval_adp(facilities)
+
+# Export the data
+wb_workbook() %>% 
+  wb_add_worksheet("facilities") %>% 
+  wb_add_data("facilities", facilities %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+```
+
+```{r # Filter to just the region's facilities}
+local_facilities <- facilities %>% 
+  filter(state %in% c("DE", "NJ", "PA"))
+
+nj_facilities <- facilities %>% 
+  filter(state == "NJ")
+
+pa_facilities <- facilities %>% 
+  filter(state == "PA")
+
+# Export the data
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("local_facilities") %>% 
+  wb_add_data("local_facilities", local_facilities %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("nj_facilities") %>% 
+  wb_add_data("nj_facilities", nj_facilities %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("pa_facilities") %>% 
+  wb_add_data("pa_facilities", pa_facilities %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+```
+
+```{r QUESTION: How has the number of people detained in the region's facilities changed between Trump's inauguration and late July?}
+local_facilities_by_month <- local_facilities %>% 
+  select(name, file_name, extract_date, adp, interval_adp) %>% 
+  pivot_wider(names_from = extract_date,
+              values_from = interval_adp,
+              id_cols = "name")
+
+local_facilities_by_month %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  ) %>% 
+  mutate(change = `2025-07-21` - `2025-01-21`,
+         pct_change = round((change / `2025-01-21`) * 100))
+
+nj_facilities_by_month <- nj_facilities %>% 
+  select(name, file_name, extract_date, adp, interval_adp) %>% 
+  pivot_wider(names_from = extract_date,
+              values_from = interval_adp,
+              id_cols = "name")
+
+nj_facilities_by_month %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  ) %>% 
+  mutate(change = `2025-07-21` - `2025-01-21`,
+         pct_change = round((change / `2025-01-21`) * 100))
+
+pa_facilities_by_month <- pa_facilities %>% 
+  select(name, file_name, extract_date, adp, interval_adp) %>% 
+  pivot_wider(names_from = extract_date,
+              values_from = interval_adp,
+              id_cols = "name")
+
+pa_facilities_by_month %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  ) %>% 
+  mutate(change = `2025-07-21` - `2025-01-21`,
+         pct_change = round((change / `2025-01-21`) * 100))
+
+# Export the data
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("local_facilities_by_month") %>% 
+  wb_add_data("local_facilities_by_month", local_facilities_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("nj_facilities_by_month") %>% 
+  wb_add_data("nj_facilities_by_month", nj_facilities_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("pa_facilities_by_month") %>% 
+  wb_add_data("pa_facilities_by_month", pa_facilities_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+```
+
+```{r QUESTION: How has the number of facilities detaining people in the region changed between Trump's inauguration and late July?}
+local_facilities_by_month %>% 
+  group_by(name) %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  )
+
+nj_facilities_by_month %>% 
+  group_by(name) %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  )
+
+pa_facilities_by_month %>% 
+  group_by(name) %>% 
+  summarize(
+    `2025-01-21` = sum(`2025-01-21`, na.rm = TRUE),
+    `2025-07-21` = sum(`2025-07-21`, na.rm = TRUE)
+  )
+```
+
+```{r QUESTION: How has the criminality of the people detained in the region changed between Trump's inauguration and late July?}
+local_criminality_by_month <- local_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_crim = sum(interval_crim, na.rm = TRUE),
+    interval_non_crim = sum(interval_non_crim, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_crim = round((interval_crim / (interval_crim + interval_non_crim)) * 100),
+    pct_interval_non_crim = round((interval_non_crim / (interval_crim + interval_non_crim)) * 100)
+  )
+
+nj_criminality_by_month <- nj_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_crim = sum(interval_crim, na.rm = TRUE),
+    interval_non_crim = sum(interval_non_crim, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_crim = round((interval_crim / (interval_crim + interval_non_crim)) * 100),
+    pct_interval_non_crim = round((interval_non_crim / (interval_crim + interval_non_crim)) * 100)
+  )
+
+pa_criminality_by_month <- pa_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_crim = sum(interval_crim, na.rm = TRUE),
+    interval_non_crim = sum(interval_non_crim, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_crim = round((interval_crim / (interval_crim + interval_non_crim)) * 100),
+    pct_interval_non_crim = round((interval_non_crim / (interval_crim + interval_non_crim)) * 100)
+  )
+
+local_facilities_criminality_by_month <- local_facilities %>% 
+  group_by(extract_date, name) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_crim = sum(interval_crim, na.rm = TRUE),
+    interval_non_crim = sum(interval_non_crim, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_crim = round((interval_crim / (interval_crim + interval_non_crim)) * 100),
+    pct_interval_non_crim = round((interval_non_crim / (interval_crim + interval_non_crim)) * 100)
+  ) %>% 
+  arrange(name, extract_date)
+
+# Export the data
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("local_criminality_by_month") %>% 
+  wb_add_data("local_criminality_by_month", local_criminality_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("nj_criminality_by_month") %>% 
+  wb_add_data("nj_criminality_by_month", nj_criminality_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("pa_criminality_by_month") %>% 
+  wb_add_data("pa_criminality_by_month", pa_criminality_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("loc_fac_criminality_by_month") %>% 
+  wb_add_data("loc_fac_criminality_by_month", local_facilities_criminality_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+```
+
+```{r QUESTION: How has the security risk of the people detained in the region changed between Trump's inauguration and late July?}
+local_security_risk_by_month <- local_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_level_a = sum(interval_level_a, na.rm = TRUE),
+    interval_level_b = sum(interval_level_b, na.rm = TRUE),
+    interval_level_c = sum(interval_level_c, na.rm = TRUE),
+    interval_level_d = sum(interval_level_d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_level_a = round((interval_level_a / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_b = round((interval_level_b / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_c = round((interval_level_c / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_d = round((interval_level_d / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+  )
+
+nj_security_risk_by_month <- nj_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_level_a = sum(interval_level_a, na.rm = TRUE),
+    interval_level_b = sum(interval_level_b, na.rm = TRUE),
+    interval_level_c = sum(interval_level_c, na.rm = TRUE),
+    interval_level_d = sum(interval_level_d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_level_a = round((interval_level_a / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_b = round((interval_level_b / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_c = round((interval_level_c / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_d = round((interval_level_d / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+  )
+
+pa_security_risk_by_month <- pa_facilities %>% 
+  group_by(extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_level_a = sum(interval_level_a, na.rm = TRUE),
+    interval_level_b = sum(interval_level_b, na.rm = TRUE),
+    interval_level_c = sum(interval_level_c, na.rm = TRUE),
+    interval_level_d = sum(interval_level_d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_level_a = round((interval_level_a / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_b = round((interval_level_b / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_c = round((interval_level_c / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_d = round((interval_level_d / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+  )
+
+local_facilities_security_risk_by_month <- local_facilities %>% 
+  group_by(name, extract_date) %>% 
+  summarize(
+    interval_adp = sum(interval_adp, na.rm = TRUE),
+    interval_level_a = sum(interval_level_a, na.rm = TRUE),
+    interval_level_b = sum(interval_level_b, na.rm = TRUE),
+    interval_level_c = sum(interval_level_c, na.rm = TRUE),
+    interval_level_d = sum(interval_level_d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    pct_interval_level_a = round((interval_level_a / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_b = round((interval_level_b / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_c = round((interval_level_c / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+    pct_interval_level_d = round((interval_level_d / (interval_level_a + interval_level_b + interval_level_c + interval_level_d)) * 100),
+  )
+
+# Export the data
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("local_security_risk_by_month") %>% 
+  wb_add_data("local_security_risk_by_month", local_security_risk_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("local_security_risk_by_month") %>% 
+  wb_add_data("local_security_risk_by_month", local_security_risk_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("nj_security_risk_by_month") %>% 
+  wb_add_data("nj_security_risk_by_month", nj_security_risk_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("pa_security_risk_by_month") %>% 
+  wb_add_data("pa_security_risk_by_month", pa_security_risk_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+
+wb_load("data/exported/ice_detentions.xlsx") %>% 
+  wb_add_worksheet("loc_fac_security_risk_by_month") %>% 
+  wb_add_data("loc_fac_security_risk_by_month", local_facilities_security_risk_by_month %>% 
+                mutate(across(where(is.numeric), ~ replace_na(.x, 0)),
+                       across(where(is.numeric), ~round(.x))
+                       )
+              ) %>% 
+  wb_save("data/exported/ice_detentions.xlsx", overwrite = TRUE)
+```
